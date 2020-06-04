@@ -1,10 +1,15 @@
 package com.didiglobal.booster.gradle;
 
 import com.android.build.api.artifact.ArtifactType;
+import com.android.build.api.artifact.BuildArtifactType;
+import com.android.build.gradle.BaseExtension;
+import com.android.build.gradle.internal.api.artifact.SourceArtifactType;
 import com.android.build.gradle.internal.scope.AnchorOutputType;
 import com.android.build.gradle.internal.scope.InternalArtifactType;
 import com.android.build.gradle.internal.scope.VariantScope;
+import com.android.build.gradle.tasks.ProcessAndroidResources;
 import com.android.sdklib.BuildToolInfo;
+import org.gradle.api.tasks.TaskContainer;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.File;
@@ -15,6 +20,11 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 class VariantScopeV33 {
+
+    @NotNull
+    static BaseExtension getExtension(@NotNull final VariantScope scope) {
+        return (BaseExtension) scope.getGlobalScope().getExtension();
+    }
 
     /**
      * The merged AndroidManifest.xml
@@ -67,6 +77,11 @@ class VariantScopeV33 {
     }
 
     @NotNull
+    static Collection<File> getAar(@NotNull final VariantScope scope) {
+        return getFinalArtifactFiles(scope, InternalArtifactType.AAR);
+    }
+
+    @NotNull
     static Collection<File> getApk(@NotNull final VariantScope scope) {
         return getFinalArtifactFiles(scope, InternalArtifactType.APK);
     }
@@ -78,8 +93,12 @@ class VariantScopeV33 {
 
     @NotNull
     static Map<String, Collection<File>> getAllArtifacts(@NotNull final VariantScope scope) {
-        return Stream.concat(Arrays.stream(InternalArtifactType.values()), Arrays.stream(AnchorOutputType.values()))
-                .collect(Collectors.toMap(Enum::name, v -> getFinalArtifactFiles(scope, v)));
+        return Stream.of(
+                AnchorOutputType.values(),
+                BuildArtifactType.values(),
+                SourceArtifactType.values(),
+                InternalArtifactType.values()
+        ).flatMap(Arrays::stream).collect(Collectors.toMap(Enum::name, v -> getFinalArtifactFiles(scope, v)));
     }
 
     @NotNull
@@ -92,4 +111,14 @@ class VariantScopeV33 {
         return scope.getGlobalScope().getAndroidBuilder().getBuildToolInfo();
     }
 
+    @NotNull
+    static Collection<File> getRawAndroidResources(@NotNull final VariantScope scope) {
+        return scope.getVariantData().getAllRawAndroidResources().getFiles();
+    }
+
+    @NotNull
+    static ProcessAndroidResources getProcessResourcesTask(@NotNull final VariantScope scope) {
+        final TaskContainer tasks = scope.getGlobalScope().getProject().getTasks();
+        return (ProcessAndroidResources) tasks.getByName(scope.getTaskName("process", "Resources"));
+    }
 }

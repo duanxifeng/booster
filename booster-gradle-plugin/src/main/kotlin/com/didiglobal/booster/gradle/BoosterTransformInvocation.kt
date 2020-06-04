@@ -1,8 +1,10 @@
 package com.didiglobal.booster.gradle
 
-import com.android.SdkConstants
 import com.android.build.api.transform.Context
+import com.android.build.api.transform.DirectoryInput
 import com.android.build.api.transform.Format
+import com.android.build.api.transform.JarInput
+import com.android.build.api.transform.QualifiedContent
 import com.android.build.api.transform.SecondaryInput
 import com.android.build.api.transform.Status.ADDED
 import com.android.build.api.transform.Status.CHANGED
@@ -11,35 +13,25 @@ import com.android.build.api.transform.Status.REMOVED
 import com.android.build.api.transform.TransformInput
 import com.android.build.api.transform.TransformInvocation
 import com.android.build.api.transform.TransformOutputProvider
-import com.android.build.gradle.internal.publishing.AndroidArtifacts.ArtifactScope.ALL
-import com.android.build.gradle.internal.publishing.AndroidArtifacts.ArtifactType.AAR
-import com.android.build.gradle.internal.publishing.AndroidArtifacts.ArtifactType.JAR
-import com.android.build.gradle.internal.publishing.AndroidArtifacts.ConsumedConfigType.RUNTIME_CLASSPATH
-import com.didiglobal.booster.kotlinx.ifNotEmpty
+import com.didiglobal.booster.kotlinx.NCPU
+import com.didiglobal.booster.transform.AbstractKlassPool
 import com.didiglobal.booster.transform.ArtifactManager
-import com.didiglobal.booster.transform.Klass
-import com.didiglobal.booster.transform.KlassPool
 import com.didiglobal.booster.transform.TransformContext
-import com.didiglobal.booster.transform.TransformListener
-import com.didiglobal.booster.transform.Transformer
+import com.didiglobal.booster.transform.artifacts
 import com.didiglobal.booster.transform.util.transform
-import com.didiglobal.booster.util.search
 import java.io.File
-import java.net.URLClassLoader
-import java.util.ServiceLoader
-import java.util.concurrent.ForkJoinPool
+import java.net.URI
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 
 /**
  * Represents a delegate of TransformInvocation
  *
  * @author johnsonlee
  */
-internal class BoosterTransformInvocation(private val delegate: TransformInvocation) : TransformInvocation, TransformContext, TransformListener, ArtifactManager {
+internal class BoosterTransformInvocation(private val delegate: TransformInvocation, internal val transform: BoosterTransform) : TransformInvocation, TransformContext, ArtifactManager {
 
-    /*
-     * Preload transformers as List to fix NoSuchElementException caused by ServiceLoader in parallel mode
-     */
-    private val transformers = ServiceLoader.load(Transformer::class.java, javaClass.classLoader).toList()
+    private val executor = Executors.newWorkStealingPool(NCPU)
 
     override val name: String = delegate.context.variantName
 
@@ -51,7 +43,7 @@ internal class BoosterTransformInvocation(private val delegate: TransformInvocat
 
     override val reportsDir: File = File(buildDir, "reports").also { it.mkdirs() }
 
-    override val executor = ForkJoinPool(Runtime.getRuntime().availableProcessors(), ForkJoinPool.defaultForkJoinWorkerThreadFactory, null, true)
+    override val bootClasspath = delegate.bootClasspath
 
     override val compileClasspath = delegate.compileClasspath
 
@@ -59,17 +51,20 @@ internal class BoosterTransformInvocation(private val delegate: TransformInvocat
 
     override val artifacts = this
 
-    override val klassPool = KlassPoolImpl(runtimeClasspath)
+    override val klassPool: AbstractKlassPool = object : AbstractKlassPool(compileClasspath, transform.bootKlassPool) {}
 
     override val applicationId = delegate.applicationId
 
-    override fun hasProperty(name: String): Boolean {
-        return project.hasProperty(name)
-    }
+    override val originalApplicationId = delegate.originalApplicationId
 
-    override fun getProperty(name: String): String? {
-        return project.properties[name]?.toString()
-    }
+    override val isDebuggable = variant.buildType.isDebuggable
+
+    override val isDataBindingEnabled = delegate.isDataBindingEnabled
+
+    override fun hasProperty(name: String) = project.hasProperty(name)
+
+    @Suppress("UNCHECKED_CAST")
+    override fun <T> getProperty(name: String, default: T): T = project.properties[name] as? T ?: default
 
     override fun getInputs(): MutableCollection<TransformInput> = delegate.inputs
 
@@ -79,143 +74,120 @@ internal class BoosterTransformInvocation(private val delegate: TransformInvocat
 
     override fun isIncremental() = delegate.isIncremental
 
-    override fun getOutputProvider(): TransformOutputProvider = delegate.outputProvider
+    override fun getOutputProvider(): TransformOutputProvider? = delegate.outputProvider
 
     override fun getContext(): Context = delegate.context
 
-    override fun onPreTransform(context: TransformContext) = transformers.forEach {
-        it.onPreTransform(this)
+    override fun get(type: String) = variant.artifacts.get(type)
+
+    internal fun doFullTransform() = doTransform(this::transformFully)
+
+    internal fun doIncrementalTransform() = doTransform(this::transformIncrementally)
+
+    private val tasks = mutableListOf<Future<*>>()
+
+    private fun onPreTransform() {
+        transform.transformers.forEach {
+            it.onPreTransform(this)
+        }
     }
 
-    override fun onPostTransform(context: TransformContext) = transformers.forEach {
-        it.onPostTransform(this)
+    private fun onPostTransform() {
+        tasks.forEach {
+            it.get()
+        }
+        transform.transformers.forEach {
+            it.onPostTransform(this)
+        }
     }
 
-    override fun get(type: String): Collection<File> = when (type) {
-        ArtifactManager.AAR                           -> variant.scope.getArtifactCollection(RUNTIME_CLASSPATH, ALL, AAR).artifactFiles.files
-        ArtifactManager.ALL_CLASSES                   -> variant.scope.allClasses
-        ArtifactManager.APK                           -> variant.scope.apk
-        ArtifactManager.JAR                           -> variant.scope.getArtifactCollection(RUNTIME_CLASSPATH, ALL, JAR).artifactFiles.files
-        ArtifactManager.JAVAC                         -> variant.scope.javac
-        ArtifactManager.MERGED_ASSETS                 -> variant.scope.mergedAssets
-        ArtifactManager.MERGED_RES                    -> variant.scope.mergedRes
-        ArtifactManager.MERGED_MANIFESTS              -> variant.scope.mergedManifests.search { SdkConstants.FN_ANDROID_MANIFEST_XML == it.name }
-        ArtifactManager.PROCESSED_RES                 -> variant.scope.processedRes.search { it.name.startsWith(SdkConstants.FN_RES_BASE) && it.name.endsWith(SdkConstants.EXT_RES) }
-        ArtifactManager.SYMBOL_LIST                   -> variant.scope.symbolList
-        ArtifactManager.SYMBOL_LIST_WITH_PACKAGE_NAME -> variant.scope.symbolListWithPackageName
-        else -> TODO("Unexpected type: $type")
+    private fun doTransform(block: () -> Unit) {
+        this.onPreTransform()
+        block()
+        this.onPostTransform()
     }
 
-    internal fun doFullTransform() {
-        this.inputs.parallelStream().forEach { input ->
-            input.directoryInputs.parallelStream().forEach {
-                project.logger.info("Transforming ${it.file}")
-                it.file.transform(outputProvider.getContentLocation(it.file.name, it.contentTypes, it.scopes, Format.DIRECTORY)) { bytecode ->
-                    bytecode.transform(this)
+    private fun transformFully() {
+        this.inputs.map {
+            it.jarInputs + it.directoryInputs
+        }.flatten().forEach { input ->
+            tasks += executor.submit {
+                val format = if (input is DirectoryInput) Format.DIRECTORY else Format.JAR
+                outputProvider?.let { provider ->
+                    project.logger.info("Transforming ${input.file}")
+                    input.transform(provider.getContentLocation(input.name, input.contentTypes, input.scopes, format), this)
                 }
             }
-            input.jarInputs.parallelStream().forEach {
-                project.logger.info("Transforming ${it.file}")
-                it.file.transform(outputProvider.getContentLocation(it.name, it.contentTypes, it.scopes, Format.JAR)) { bytecode ->
-                    bytecode.transform(this)
+        }
+    }
+
+    private fun transformIncrementally() {
+        this.inputs.parallelStream().forEach { input ->
+            input.jarInputs.parallelStream().filter { it.status != NOTCHANGED }.forEach { jarInput ->
+                tasks += executor.submit {
+                    doIncrementalTransform(jarInput)
+                }
+            }
+            input.directoryInputs.parallelStream().filter { it.changedFiles.isNotEmpty() }.forEach { dirInput ->
+                val base = dirInput.file.toURI()
+                tasks += executor.submit {
+                    doIncrementalTransform(dirInput, base)
                 }
             }
         }
     }
 
     @Suppress("NON_EXHAUSTIVE_WHEN")
-    internal fun doIncrementalTransform() {
-        this.inputs.parallelStream().forEach { input ->
-            input.jarInputs.parallelStream().filter { it.status != NOTCHANGED }.forEach { jarInput ->
-                when (jarInput.status) {
-                    REMOVED -> jarInput.file.delete()
-                    CHANGED, ADDED -> {
-                        val root = outputProvider.getContentLocation(jarInput.name, jarInput.contentTypes, jarInput.scopes, Format.JAR)
-                        project.logger.info("Transforming ${jarInput.file}")
-                        jarInput.file.transform(root) { bytecode ->
+    private fun doIncrementalTransform(jarInput: JarInput) {
+        when (jarInput.status) {
+            REMOVED -> jarInput.file.delete()
+            CHANGED, ADDED -> {
+                project.logger.info("Transforming ${jarInput.file}")
+                outputProvider?.let { provider ->
+                    jarInput.transform(provider.getContentLocation(jarInput.name, jarInput.contentTypes, jarInput.scopes, Format.JAR), this)
+                }
+            }
+        }
+    }
+
+    @Suppress("NON_EXHAUSTIVE_WHEN")
+    private fun doIncrementalTransform(dirInput: DirectoryInput, base: URI) {
+        dirInput.changedFiles.forEach { (file, status) ->
+            when (status) {
+                REMOVED -> {
+                    project.logger.info("Deleting $file")
+                    outputProvider?.let { provider ->
+                        provider.getContentLocation(dirInput.name, dirInput.contentTypes, dirInput.scopes, Format.DIRECTORY).parentFile.listFiles()?.asSequence()
+                            ?.filter { it.isDirectory }
+                            ?.map { File(it, dirInput.file.toURI().relativize(file.toURI()).path) }
+                            ?.filter { it.exists() }
+                            ?.forEach { it.delete() }
+                    }
+                    file.delete()
+                }
+                ADDED, CHANGED -> {
+                    project.logger.info("Transforming $file")
+                    outputProvider?.let { provider ->
+                        val root = provider.getContentLocation(dirInput.name, dirInput.contentTypes, dirInput.scopes, Format.DIRECTORY)
+                        val output = File(root, base.relativize(file.toURI()).path)
+                        file.transform(output) { bytecode ->
                             bytecode.transform(this)
                         }
                     }
                 }
             }
-
-            input.directoryInputs.parallelStream().forEach { dirInput ->
-                val base = dirInput.file.toURI()
-                dirInput.changedFiles.ifNotEmpty {
-                    it.forEach { file, status ->
-                        when (status) {
-                            REMOVED -> file.delete()
-                            ADDED, CHANGED -> {
-                                val root = outputProvider.getContentLocation(dirInput.name, dirInput.contentTypes, dirInput.scopes, Format.DIRECTORY)
-                                project.logger.info("Transforming $file")
-                                file.transform(File(root, base.relativize(file.toURI()).path)) { bytecode ->
-                                    bytecode.transform(this)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
-
-    private fun ByteArray.transform(invocation: BoosterTransformInvocation): ByteArray {
-        return transformers.fold(this) { bytes, transformer ->
-            transformer.transform(invocation, bytes)
-        }
-    }
-
-    internal class KlassPoolImpl(private val classpath: Collection<File>) : KlassPool {
-
-        private val classLoader = URLClassLoader(classpath.map { it.toURI().toURL() }.toTypedArray())
-
-        private val klasses = mutableMapOf<String, Klass>()
-
-        override fun get(type: String): Klass {
-            val name = normalize(type)
-            return klasses.getOrDefault(name, findClass(name))
-        }
-
-        internal fun findClass(name: String): Klass {
-            return try {
-                LoadedKlass(this, Class.forName(name, false, classLoader)).also {
-                    klasses[name] = it
-                }
-            } catch (e: Throwable) {
-                DefaultKlass(name)
-            }
-        }
-
-        override fun toString(): String {
-            return "classpath: $classpath"
-        }
-
-    }
-
-    internal class DefaultKlass(name: String) : Klass {
-
-        override val qualifiedName: String = name
-
-        override fun isAssignableFrom(type: String) = false
-
-        override fun isAssignableFrom(klass: Klass) = klass.qualifiedName == this.qualifiedName
-
-    }
-
-    internal class LoadedKlass(val pool: KlassPoolImpl, val clazz: Class<out Any>) : Klass {
-
-        override val qualifiedName: String = clazz.name
-
-        override fun isAssignableFrom(type: String) = isAssignableFrom(pool.findClass(normalize(type)))
-
-        override fun isAssignableFrom(klass: Klass) = klass is LoadedKlass && clazz.isAssignableFrom(klass.clazz)
-
-    }
-
 }
 
-private fun normalize(type: String) = if (type.contains('/')) {
-    type.replace('/', '.')
-} else {
-    type
+private fun ByteArray.transform(invocation: BoosterTransformInvocation): ByteArray {
+    return invocation.transform.transformers.fold(this) { bytes, transformer ->
+        transformer.transform(invocation, bytes)
+    }
+}
+
+private fun QualifiedContent.transform(output: File, invocation: BoosterTransformInvocation) {
+    this.file.transform(output) { bytecode ->
+        bytecode.transform(invocation)
+    }
 }

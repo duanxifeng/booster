@@ -1,15 +1,14 @@
 package com.didiglobal.booster.gradle
 
-import com.android.build.api.transform.QualifiedContent
-import com.android.build.gradle.internal.pipeline.TransformManager
+import org.gradle.api.Project
 
 /**
  * Represents android transform for application project
  *
  * @author johnsonlee
  */
-class BoosterAppTransform : BoosterTransform() {
-
-    override fun getScopes(): MutableSet<in QualifiedContent.Scope> = TransformManager.SCOPE_FULL_PROJECT
-
-}
+@Deprecated(
+        message = "Use class BoosterTransform instead",
+        replaceWith = ReplaceWith(expression = "BoosterTransform(project)")
+)
+class BoosterAppTransform(project: Project) : BoosterTransform(project)
